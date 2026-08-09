@@ -1,8 +1,12 @@
-# your setup and your data — never commit these
+# your setup and your data, never commit these
 config.json
+config.pending.json
 state/
 bin/
 vendor/
+.venv/
+private/
+ACCEPTANCE_REPORT.md
 .env
 *.p8
 

@@ -1,8 +1,8 @@
-"""AutoWarmer — warm up your own Instagram and TikTok accounts on your own iPhone.
+"""AutoWarmer v1.0.0 diagnostic-only safety build.
 
-Everything runs on this Mac: no account is created here, no data leaves the
-machine, and no server is involved. The dashboard is a local page talking to a
-local process that drives phones over USB.
+This local copy can install pinned Mac helpers and report redacted USB device
+facts. Account planning, social-app control, signing, and iOS installation are
+disabled because the release does not include its required runner source.
 """
 __version__ = "1.0.0"
 APP_NAME = "AutoWarmer"

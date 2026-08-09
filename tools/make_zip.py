@@ -11,8 +11,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-INCLUDE = ["autowarmer", "tools/vision_ocr.swift", "README.md", "LICENSE",
-           "config.example.json", "AutoWarmer.command"]
+INCLUDE = ["autowarmer", "README.md", "LICENSE", "AutoWarmer.command"]
 
 
 def main() -> None:

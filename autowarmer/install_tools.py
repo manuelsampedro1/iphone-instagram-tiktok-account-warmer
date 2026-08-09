@@ -1,73 +1,41 @@
-"""Install the helper tools for the user, instead of telling them to.
+"""Install the single helper used by the diagnostic safety build.
 
-Setup used to print instructions and hope. Two of the four things AutoWarmer
-needs can simply be fetched, so they are: go-ios (a release binary from
-GitHub) and pymobiledevice3 (a pip package). Both land somewhere the app owns
-— no sudo, no PATH edits, nothing touched outside the user's own account.
-
-Xcode is the exception and always will be: it is a 10 GB App Store install
-that only the person at the keyboard can accept the licence for.
-
-Everything here streams progress with `log` because it runs as a job whose
-output the dashboard shows live.
+The helper lands in this project. No sudo, PATH edits, Apple signing,
+provisioning, phone installation, Python package installation, or Swift
+compilation is performed here.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
-GO_IOS_LATEST = "https://api.github.com/repos/danielpaulus/go-ios/releases/latest"
-GO_IOS_FALLBACK = ("https://github.com/danielpaulus/go-ios/releases/latest/"
-                   "download/go-ios-mac.zip")
-
-
-def _run(argv, log, timeout=900) -> subprocess.CompletedProcess:
-    log("  $ " + " ".join(str(a) for a in argv))
-    p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-    for line in (p.stdout or "").splitlines()[-12:]:
-        log("    " + line)
-    if p.returncode != 0:
-        for line in (p.stderr or "").splitlines()[-12:]:
-            log("    " + line)
-    return p
+GO_IOS_VERSION = "v1.2.1"
+GO_IOS_URL = ("https://github.com/danielpaulus/go-ios/releases/download/"
+              f"{GO_IOS_VERSION}/go-ios-mac.zip")
+GO_IOS_SHA256 = "52acff5caa4b8ccb84cab0d44d988f3110a6773a43134281a899ae3c458c866c"
+GO_IOS_BINARY_SHA256 = "b8a279520a875c62d281a7a9e23fe187401ab1c4af1eb328e329ce6e364d8611"
+MAX_GO_IOS_BYTES = 128 * 1024 * 1024
 
 
 # ------------------------------------------------------------------ go-ios
 
-def _mac_asset_url(log: Callable[[str], None]) -> str:
-    """The macOS build of the newest go-ios release."""
-    try:
-        req = urllib.request.Request(
-            GO_IOS_LATEST, headers={"Accept": "application/vnd.github+json",
-                                    "User-Agent": "AutoWarmer"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            rel = json.loads(r.read())
-        for a in rel.get("assets", []):
-            name = a.get("name", "").lower()
-            if "mac" in name or "darwin" in name:
-                log(f"  found {a['name']} from release {rel.get('tag_name')}")
-                return a["browser_download_url"]
-        log("  release had no macOS build listed — using the standard URL")
-    except Exception as e:                                    # noqa: BLE001
-        log(f"  could not read the release list ({e}) — using the standard URL")
-    return GO_IOS_FALLBACK
-
 
 def install_go_ios(dest_dir: Path, log: Callable[[str], None] = print) -> dict:
-    """Download go-ios and put the `ios` binary in `dest_dir`."""
+    """Install a verified go-ios release without replacing a working copy
+    until the candidate has passed its version check."""
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / "ios"
-    url = _mac_asset_url(log)
+    candidate: Path | None = None
+    url = GO_IOS_URL
     log(f"  downloading {url}")
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -75,113 +43,98 @@ def install_go_ios(dest_dir: Path, log: Callable[[str], None] = print) -> dict:
             req = urllib.request.Request(url, headers={"User-Agent": "AutoWarmer"})
             with urllib.request.urlopen(req, timeout=300) as r, \
                     open(zip_path, "wb") as f:
-                shutil.copyfileobj(r, f)
+                total = 0
+                while True:
+                    chunk = r.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_GO_IOS_BYTES:
+                        return {"ok": False, "path": "",
+                                "error": "go-ios download exceeded the size limit"}
+                    f.write(chunk)
             size = zip_path.stat().st_size
+            digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+            if digest != GO_IOS_SHA256:
+                return {"ok": False, "path": "",
+                        "error": ("go-ios download hash mismatch: expected "
+                                  f"{GO_IOS_SHA256}, got {digest}")}
             log(f"  downloaded {size/1024/1024:.1f} MB, unpacking")
             with zipfile.ZipFile(zip_path) as z:
-                member = next((m for m in z.namelist()
-                               if Path(m).name == "ios" and not m.endswith("/")), None)
-                if member is None:
+                try:
+                    member = z.getinfo("ios")
+                except KeyError:
                     return {"ok": False, "path": "",
-                            "error": "that download did not contain an `ios` binary"}
-                z.extract(member, td)
-                shutil.copyfile(Path(td) / member, dest)
+                            "error": "that download did not contain an exact `ios` binary"}
+                archived_mode = member.external_attr >> 16
+                archived_type = stat.S_IFMT(archived_mode)
+                if (member.is_dir() or archived_type == stat.S_IFLNK
+                        or archived_type not in (0, stat.S_IFREG)
+                        or member.file_size <= 0
+                        or member.file_size > MAX_GO_IOS_BYTES):
+                    return {"ok": False, "path": "",
+                            "error": "the archived `ios` member is not a safe regular file"}
+                fd, candidate_name = tempfile.mkstemp(
+                    dir=dest_dir, prefix=".ios-", suffix=".candidate")
+                candidate = Path(candidate_name)
+                with z.open(member) as src, os.fdopen(fd, "wb") as out:
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+            candidate.chmod(0o755)
+            candidate_digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            if candidate_digest != GO_IOS_BINARY_SHA256:
+                return {"ok": False, "path": "",
+                        "error": ("extracted go-ios binary hash mismatch: expected "
+                                  f"{GO_IOS_BINARY_SHA256}, got {candidate_digest}")}
+            # The exact verified candidate is the only object whose quarantine
+            # marker is removed. Never clear quarantine recursively.
+            subprocess.run(["xattr", "-d", "com.apple.quarantine", str(candidate)],
+                           capture_output=True, timeout=10)
+            check = subprocess.run([str(candidate), "version"], capture_output=True,
+                                   text=True, timeout=60)
+            if check.returncode != 0:
+                return {"ok": False, "path": "",
+                        "error": "the verified go-ios candidate would not run"}
+            try:
+                reported = str(json.loads(check.stdout).get("version", ""))
+            except (AttributeError, TypeError, json.JSONDecodeError):
+                reported = ""
+            if reported.lstrip("v") != GO_IOS_VERSION.lstrip("v"):
+                return {"ok": False, "path": "",
+                        "error": ("go-ios candidate version mismatch: expected "
+                                  f"{GO_IOS_VERSION}, got {reported or 'unknown'}")}
+            os.replace(candidate, dest)
+            candidate = None
     except Exception as e:                                    # noqa: BLE001
         return {"ok": False, "path": "",
                 "error": f"download failed: {e}. You can install it by hand from "
                          "github.com/danielpaulus/go-ios/releases"}
-    dest.chmod(dest.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    # macOS quarantines anything downloaded; without this the first run is
-    # blocked by Gatekeeper with a dialog nobody expects mid-setup.
-    subprocess.run(["xattr", "-d", "com.apple.quarantine", str(dest)],
-                   capture_output=True)
-    check = subprocess.run([str(dest), "version"], capture_output=True,
-                           text=True, timeout=60)
-    if check.returncode != 0:
-        return {"ok": False, "path": str(dest),
-                "error": "installed, but it would not run: "
-                         + (check.stderr or "").strip()[:200]}
-    log(f"  installed go-ios {(check.stdout or '').strip()} → {dest}")
-    return {"ok": True, "path": str(dest), "error": ""}
-
-
-# --------------------------------------------------------- pymobiledevice3
-
-def install_pymobiledevice3(log: Callable[[str], None] = print) -> dict:
-    """pip-install pymobiledevice3 into the user's own site-packages.
-
-    Deliberately NOT `--upgrade`: a working install is left exactly as it is.
-    This tool talks to a moving target (Apple changes the device protocols every
-    release), so silently bumping a version that currently drives someone's
-    phones is a good way to break a setup that was fine a minute ago.
-    """
-    from .setup_flow import find_tool
-    have = find_tool("pymobiledevice3")
-    if have["found"]:
-        log(f"  already installed → {have['path']} (left untouched)")
-        return {"ok": True, "path": have["path"], "error": ""}
-    log("  installing pymobiledevice3 (this can take a minute)")
-    p = _run([sys.executable, "-m", "pip", "install", "--user",
-              "pymobiledevice3"], log)
-    if p.returncode != 0:
-        return {"ok": False, "path": "",
-                "error": "pip could not install pymobiledevice3 — see the log above"}
-    from .setup_flow import find_tool
-    found = find_tool("pymobiledevice3")
-    if found["found"]:
-        log(f"  installed → {found['path']}")
-        return {"ok": True, "path": found["path"], "error": ""}
-    # installed as a module but its script dir isn't a place we look
-    return {"ok": False, "path": "",
-            "error": "installed, but the pymobiledevice3 command could not be "
-                     "found afterwards — add your Python user bin directory to PATH"}
-
-
-# ------------------------------------------------------------------- extras
-
-def build_ocr(root: Path, log: Callable[[str], None] = print) -> dict:
-    """Compile the Apple Vision text-reader AutoWarmer uses to confirm which
-    account is on screen. Doing it during setup means a missing Swift compiler
-    surfaces here, and not in the middle of the first warm-up."""
-    src = Path(root) / "tools" / "vision_ocr.swift"
-    out = Path(root) / "bin" / "vision_ocr"
-    if not src.is_file():
-        return {"ok": False, "path": "", "error": f"missing {src}"}
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if shutil.which("swiftc") is None:
-        return {"ok": False, "path": "",
-                "error": "swiftc not found — install Xcode, then run: "
-                         "sudo xcode-select -s /Applications/Xcode.app"}
-    p = _run(["swiftc", "-O", str(src), "-o", str(out)], log, timeout=600)
-    if p.returncode != 0 or not out.is_file():
-        return {"ok": False, "path": "", "error": "the text reader failed to build"}
-    log(f"  built the screen text reader → {out}")
-    return {"ok": True, "path": str(out), "error": ""}
+    finally:
+        if candidate is not None:
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                pass
+    log(f"  installed go-ios {GO_IOS_VERSION} at {dest}")
+    return {"ok": True, "path": str(dest), "error": "", "version": GO_IOS_VERSION}
 
 
 TOOLS = {
     "ios": ("go-ios", lambda root, log: install_go_ios(Path(root) / "bin", log)),
-    "pymobiledevice3": ("pymobiledevice3", lambda root, log: install_pymobiledevice3(log)),
-    "ocr": ("screen text reader", lambda root, log: build_ocr(root, log)),
 }
 
 
 def install(tool: str, root: Path, log: Callable[[str], None] = print) -> dict:
-    """Install one tool by name, or everything installable with 'all'."""
-    if tool == "all":
-        results = {}
-        for name in TOOLS:
-            log(f"— {TOOLS[name][0]}")
-            results[name] = install(name, root, log)
-        ok = all(r["ok"] for r in results.values())
-        return {"ok": ok, "results": results,
-                "error": "" if ok else "some tools could not be installed"}
+    """Install the named diagnostic helper."""
     entry = TOOLS.get(tool)
     if entry is None:
         return {"ok": False, "path": "",
                 "error": f"{tool} has to be installed by hand"}
     label, fn = entry
-    log(f"installing {label}…")
+    log(f"installing {label}...")
     res = fn(root, log)
-    log(("done — " + res["path"]) if res["ok"] else ("failed — " + res["error"]))
+    log(("done: " + res["path"]) if res["ok"] else ("failed: " + res["error"]))
     return res

@@ -1,24 +1,11 @@
-"""Locate the warm engine.
+"""Compatibility exports for the diagnostic-only safety build.
 
-AutoWarmer runs in two shapes: from this repo (the engine lives in the sibling
-`autowarmer` package) and from a packaged build (the engine modules are copied in
-beside this file). Both are normal; this module hides the difference so nothing
-else has to care.
+Phone discovery lives in diagnostics.py. The legacy engine export remains only
+to fail closed for callers of the old API.
 """
 from __future__ import annotations
 
+from .device import Config
+from .engine import Engine
 
-def _load():
-    try:                                   # packaged build: core sits beside us
-        from . import device, engine, fleet, humanize, incubation, trace
-    except ImportError:                    # repo: core lives in autowarmer/
-        from autowarmer import (device, engine, fleet,  # type: ignore
-                              humanize, incubation, trace)
-    return device, engine, fleet, humanize, incubation, trace
-
-
-device, engine, fleet, humanize, incubation, trace = _load()
-
-Config = device.Config
-GoIos = device.GoIos
-Engine = engine.Engine
+__all__ = ["Config", "Engine"]

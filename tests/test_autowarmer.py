@@ -1,415 +1,467 @@
-"""Tests for the AutoWarmer app layer — setup, validation, jobs, API.
-Runnable: python3 tests/test_autowarmer.py"""
+"""Acceptance tests for the diagnostic-only AutoWarmer safety build."""
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
-import time
+import unittest
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-# keep the suite out of the real ~/.autowarmer — tests store fake Apple keys
-os.environ["AUTOWARMER_KEYS_DIR"] = tempfile.mkdtemp(prefix="aw-keys-")
-
-from autowarmer import setup_flow as S      # noqa: E402
-from autowarmer.jobs import Busy, Runner    # noqa: E402
-
-FAILS = 0
-
-
-def check(name, cond):
-    global FAILS
-    if cond:
-        print(f"  ok   {name}")
-    else:
-        FAILS += 1
-        print(f"  FAIL {name}")
+from autowarmer import __main__ as cli  # noqa: E402
+from autowarmer import app, diagnostics, fleet, install_tools, runner_build  # noqa: E402
+from autowarmer.apps import AppFlow  # noqa: E402
+from autowarmer.device import Config, Driver, GoIos, WDA  # noqa: E402
+from autowarmer.engage import Engager  # noqa: E402
+from autowarmer.engine import Engine  # noqa: E402
+from tools import make_zip  # noqa: E402
 
 
-def fake_exe(d: Path, name: str) -> str:
-    p = d / name
-    p.write_text("#!/bin/sh\nexit 0\n")
-    p.chmod(p.stat().st_mode | stat.S_IEXEC)
-    return str(p)
+class FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
 
 
-def good_config(tmp: Path) -> dict:
-    return {"ios_binary": fake_exe(tmp, "ios"),
-            "iproxy_binary": fake_exe(tmp, "iproxy"),
-            "pymobiledevice3_binary": fake_exe(tmp, "pmd3"),
-            "signing": {"p8_path": str(_p8(tmp)), "key_id": "ABC1234567",
-                        "issuer_id": "11111111-2222-3333-4444-555555555555",
-                        "team_id": "TEAM123456"},
-            "devices": [{"udid": "UDID-A", "name": "iphone-1",
-                         "wda_bundle_id": "com.team123456.autowarmer.wda.xctrunner",
-                         "accounts": [{"platform": "instagram", "username": "acct_a",
-                                       "created_at": "2026-08-01", "keywords": ["x"]}]}]}
+def zip_with_ios(payload: bytes = b"verified-go-ios") -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("ios", payload)
+    return out.getvalue()
 
 
-def _p8(tmp: Path) -> Path:
-    p = tmp / "signing-key.p8"
-    p.write_text("-not-a-real-key-")
-    return p
+class DiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        self.verify = mock.patch.object(
+            diagnostics, "_verified_binary", side_effect=lambda path: path)
+        self.verify.start()
+        self.addCleanup(self.verify.stop)
+
+    def test_happy_path_is_redacted_and_uses_only_list_and_info(self):
+        ids = ("a" * 40, "b" * 40)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if argv[-1] == "list":
+                body = {"deviceList": list(ids)}
+            else:
+                body = {
+                    "DeviceName": "Private owner name",
+                    "ProductType": "iPhone12,1",
+                    "ProductVersion": "26.4.2",
+                    "UniqueDeviceID": argv[-1],
+                }
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+
+        with mock.patch.object(diagnostics.subprocess, "run", side_effect=fake_run):
+            rows = diagnostics.inspect_devices("/verified/ios", 2, "iPhone12,1")
+
+        self.assertEqual(rows, [
+            {"slot": 1, "model": "iPhone12,1", "ios": "26.4.2"},
+            {"slot": 2, "model": "iPhone12,1", "ios": "26.4.2"},
+        ])
+        self.assertEqual([item[0] for item in calls], [
+            ["/verified/ios", "list"],
+            ["/verified/ios", "info", "--udid", ids[0]],
+            ["/verified/ios", "info", "--udid", ids[1]],
+        ])
+        serialized = json.dumps(rows)
+        self.assertNotIn(ids[0], serialized)
+        self.assertNotIn(ids[1], serialized)
+        self.assertNotIn("Private owner name", serialized)
+        self.assertTrue(all(call[1]["capture_output"] for call in calls))
+        self.assertTrue(all(call[1]["timeout"] == 20 for call in calls))
+
+    def test_count_gate_stops_before_device_info(self):
+        result = subprocess.CompletedProcess([], 0,
+                                             json.dumps({"deviceList": ["a" * 40]}), "")
+        with mock.patch.object(diagnostics.subprocess, "run", return_value=result) as run:
+            with self.assertRaisesRegex(diagnostics.DiagnosticError,
+                                        "expected 2 connected iPhones, found 1"):
+                diagnostics.inspect_devices("/verified/ios", 2, "iPhone12,1")
+        self.assertEqual(run.call_count, 1)
+
+    def test_duplicate_device_is_rejected(self):
+        udid = "a" * 40
+        result = subprocess.CompletedProcess([], 0,
+                                             json.dumps({"deviceList": [udid, udid]}), "")
+        with mock.patch.object(diagnostics.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(diagnostics.DiagnosticError, "duplicate"):
+                diagnostics.inspect_devices("/verified/ios")
+
+    def test_tool_error_never_echoes_private_output(self):
+        private = "Private Name " + "a" * 40 + " /Users/private/path"
+        result = subprocess.CompletedProcess([], 9, private, private)
+        with mock.patch.object(diagnostics.subprocess, "run", return_value=result):
+            with self.assertRaises(diagnostics.DiagnosticError) as caught:
+                diagnostics.inspect_devices("/verified/ios")
+        message = str(caught.exception)
+        self.assertEqual(message, "device list failed with exit 9")
+        self.assertNotIn("Private", message)
+        self.assertNotIn("/Users", message)
+
+    def test_start_failure_never_echoes_executable_path(self):
+        with mock.patch.object(diagnostics.subprocess, "run",
+                               side_effect=OSError("/private/evil")):
+            with self.assertRaises(diagnostics.DiagnosticError) as caught:
+                diagnostics.inspect_devices("/private/evil")
+        self.assertEqual(str(caught.exception), "device list could not start")
+
+    def test_model_and_required_fields_are_enforced(self):
+        listing = subprocess.CompletedProcess([], 0,
+                                              json.dumps({"deviceList": ["a" * 40]}), "")
+        wrong = subprocess.CompletedProcess([], 0,
+                                            json.dumps({"ProductType": "iPhone15,2",
+                                                        "ProductVersion": "26.4"}), "")
+        with mock.patch.object(diagnostics.subprocess, "run",
+                               side_effect=[listing, wrong]):
+            with self.assertRaisesRegex(diagnostics.DiagnosticError,
+                                        "unexpected model iPhone15,2"):
+                diagnostics.inspect_devices("/verified/ios", 1, "iPhone12,1")
 
 
-def test_detection():
-    print("tool detection")
-    tools = S.detect_all()
-    names = [t["name"] for t in tools]
-    check("looks for all four tools",
-          names == ["xcode", "git", "ios", "pymobiledevice3"])
-    check("iproxy is not demanded (nothing runs it)", "iproxy" not in names)
-    check("each tool explains what it is for", all(t["why"] for t in tools))
-    check("only the fetchable ones offer auto-install",
-          {t["name"] for t in tools if t["installable"]} == {"ios", "pymobiledevice3"})
-    check("only ordinary install locations are searched",
-          all(("/bin/" in c or "/opt/" in c or c.startswith("~"))
-              for paths in S.KNOWN.values() for c in paths))
-    check("every tool carries an install hint", all(t["hint"] for t in tools))
-    check("every tool reports found/path keys",
-          all({"found", "path", "label", "source"} <= set(t) for t in tools))
-    d = Path(tempfile.mkdtemp())
-    exe = fake_exe(d, "thing")
-    check("valid executable accepted", S.check_path("ios", exe)["ok"])
-    check("missing path rejected", not S.check_path("ios", str(d / "nope"))["ok"])
-    txt = d / "plain.txt"
-    txt.write_text("x")
-    check("non-executable rejected", not S.check_path("ios", str(txt))["ok"])
-    check("CommandLineTools rejected as Xcode",
-          not S.check_path("xcode", "/Library/Developer/CommandLineTools")["ok"])
-    check("CommandLineTools says why",
-          "full Xcode" in S.check_path("xcode", "/Library/Developer/CommandLineTools")["why"])
-    check("home paths expand", S.check_path("xcode", "~")["ok"])
+class BinaryIntegrityTests(unittest.TestCase):
+    def test_verified_helper_requires_hash_execute_bit_and_version(self):
+        payload = b"pinned-helper"
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "ios"
+            binary.write_bytes(payload)
+            binary.chmod(0o755)
+            version = subprocess.CompletedProcess(
+                [], 0, '{"version":"1.2.1"}', "")
+            with mock.patch.object(
+                    diagnostics, "GO_IOS_BINARY_SHA256",
+                    hashlib.sha256(payload).hexdigest()), \
+                    mock.patch.object(diagnostics.subprocess, "run",
+                                      return_value=version) as run:
+                self.assertEqual(diagnostics._verified_binary(str(binary)),
+                                 str(binary))
+        run.assert_called_once_with(
+            [str(binary), "version"], capture_output=True, text=True, timeout=20)
+
+    def test_hash_mismatch_fails_before_helper_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "ios"
+            binary.write_bytes(b"unexpected")
+            binary.chmod(0o755)
+            with mock.patch.object(diagnostics.subprocess, "run") as run:
+                with self.assertRaisesRegex(diagnostics.DiagnosticError, "SHA-256"):
+                    diagnostics._verified_binary(str(binary))
+        run.assert_not_called()
 
 
-def test_bundle_and_signing():
-    print("signing")
-    check("bundle id from team", S.bundle_id_for("AB12CD34EF")
-          == "com.ab12cd34ef.autowarmer.wda.xctrunner")
-    check("bundle id sanitizes junk", S.bundle_id_for("A B-C!")
-          == "com.abc.autowarmer.wda.xctrunner")
-    check("blank team still yields a valid id",
-          S.bundle_id_for("") == "com.team.autowarmer.wda.xctrunner")
-    probs = S.validate_signing({})
-    check("empty signing reports all four", len(probs) == 4)
-    tmp = Path(tempfile.mkdtemp())
-    ok = {"p8_path": str(_p8(tmp)), "key_id": "K", "issuer_id": "I", "team_id": "T"}
-    check("complete signing passes", S.validate_signing(ok) == [])
-    bad = {**ok, "p8_path": str(tmp / "gone.p8")}
-    check("missing p8 file caught", any("no .p8" in p for p in S.validate_signing(bad)))
+class ControlGateTests(unittest.TestCase):
+    def assert_blocked(self, callback):
+        with self.assertRaisesRegex(RuntimeError, "runner installation.*disabled"):
+            callback()
+
+    def test_every_legacy_control_constructor_fails_closed(self):
+        self.assert_blocked(lambda: Config(udid="secret"))
+        self.assert_blocked(lambda: GoIos(object()))
+        self.assert_blocked(lambda: WDA(8100))
+        self.assert_blocked(lambda: Driver(object()))
+        self.assert_blocked(lambda: AppFlow("instagram", object(), object()))
+        self.assert_blocked(lambda: Engager("tiktok", object(), object()))
+        self.assert_blocked(lambda: Engine(object(), ROOT / "state"))
+
+    def test_fleet_entry_points_fail_before_file_or_device_access(self):
+        self.assert_blocked(lambda: fleet.connected_udids(object()))
+        self.assert_blocked(lambda: fleet.warm_all("/does/not/exist", ROOT / "state"))
+        self.assert_blocked(lambda: fleet.status("/does/not/exist"))
+        self.assert_blocked(lambda: fleet.onboard("/does/not/exist", "secret"))
+
+    def test_runner_stub_does_not_read_signing_configuration(self):
+        class Trap:
+            def __getattribute__(self, name):
+                raise AssertionError(f"configuration was read: {name}")
+
+        logs = []
+        result = runner_build.install_runner(Trap(), "secret", ROOT, logs.append)
+        self.assertFalse(result["ok"])
+        self.assertEqual(logs, [runner_build.RUNNER_BLOCK_REASON])
 
 
-def test_apple_key_storage():
-    print("apple key storage")
-    tmp = Path(tempfile.mkdtemp())
-    keys = tmp / "keys"
-    src = tmp / "Downloads" / "signing-key.p8"
-    src.parent.mkdir(parents=True)
-    src.write_text("-not-a-real-key-")
-    out = S.store_p8(str(src), str(keys))
-    dest = Path(out["path"])
-    check("copied into our own folder", out["copied"] and dest.parent == keys)
-    check("contents preserved", dest.read_text() == "-not-a-real-key-")
-    check("key is private (0600)", stat.S_IMODE(dest.stat().st_mode) == 0o600)
-    check("folder is private (0700)", stat.S_IMODE(keys.stat().st_mode) == 0o700)
-    check("note tells the user what happened", "readable only by you" in out["note"])
-    again = S.store_p8(out["path"], str(keys))
-    check("re-saving does not re-copy", not again["copied"])
-    check("original can now be deleted", (src.unlink() or Path(out["path"]).is_file()))
-    missing = S.store_p8(str(tmp / "gone.p8"), str(keys))
-    check("missing file left for validation to report", not missing["copied"])
+class CliTests(unittest.TestCase):
+    def test_diagnose_uses_only_the_fixed_project_binary(self):
+        with mock.patch.object(diagnostics, "inspect_devices", return_value=[]) as inspect:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.main(["diagnose", "--expect-count", "2", "--model", "iPhone12,1"])
+        inspect.assert_called_once_with(str(ROOT / "bin" / "ios"), 2, "iPhone12,1")
 
-    # config records the path, never the key material
-    cfg = S.build_config({}, {"p8_path": str(dest), "key_id": "K", "issuer_id": "I",
-                              "team_id": "T"}, [], keys_dir=str(keys))
-    check("config stores the path", cfg["signing"]["p8_path"] == str(dest))
-    check("config never contains key material",
-          "-not-a-real-key-" not in json.dumps(cfg))
+    def test_caller_cannot_supply_an_executable_path(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                cli.main(["diagnose", "--ios-binary", "/tmp/other"])
+        self.assertEqual(caught.exception.code, 2)
 
+    def test_all_old_mutating_verbs_are_unregistered(self):
+        cases = (["status"], ["warm", "someone", "--live"],
+                 ["warm-all"], ["onboard", "secret-device"])
+        for argv in cases:
+            error = io.StringIO()
+            with self.subTest(argv=argv), contextlib.redirect_stderr(error):
+                with self.assertRaises(SystemExit) as caught:
+                    cli.main(argv)
+                self.assertEqual(caught.exception.code, 2)
+            self.assertNotIn("someone", error.getvalue())
+            self.assertNotIn("secret-device", error.getvalue())
 
-def test_config_validation():
-    print("config validation")
-    tmp = Path(tempfile.mkdtemp())
-    cfg = good_config(tmp)
-    check("good config is clean", S.validate_config(cfg) == [])
-    no_dev = {**cfg, "devices": []}
-    check("no phones caught", any("at least one iPhone" in p
-                                  for p in S.validate_config(no_dev)))
-    dup = json.loads(json.dumps(cfg))
-    dup["devices"].append(json.loads(json.dumps(dup["devices"][0])))
-    check("same phone twice caught", any("listed twice" in p
-                                         for p in S.validate_config(dup)))
-    two = json.loads(json.dumps(cfg))
-    two["devices"].append({"udid": "UDID-B", "name": "iphone-2",
-                           "accounts": [dict(two["devices"][0]["accounts"][0])]})
-    check("account on two phones caught",
-          any("more than one phone" in p for p in S.validate_config(two)))
-    nodate = json.loads(json.dumps(cfg))
-    nodate["devices"][0]["accounts"][0]["created_at"] = ""
-    check("missing creation date caught",
-          any("created" in p for p in S.validate_config(nodate)))
-    badbin = {**cfg, "ios_binary": "/nope/ios"}
-    check("bad binary path caught",
-          any("go-ios" in p for p in S.validate_config(badbin)))
+    def test_no_arguments_prints_help_without_starting_server(self):
+        output = io.StringIO()
+        with mock.patch.object(cli, "cmd_serve") as serve, \
+                contextlib.redirect_stdout(output):
+            cli.main([])
+        serve.assert_not_called()
+        self.assertIn("diagnostic-only safety build", output.getvalue())
+
+    def test_removed_installer_targets_are_rejected_by_parser(self):
+        for target in ("all", "pymobiledevice3", "vision_ocr"):
+            with self.subTest(target=target), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    cli.main(["install", target])
+                self.assertEqual(caught.exception.code, 2)
 
 
-def test_build_and_save_config():
-    print("building config")
-    tmp = Path(tempfile.mkdtemp())
-    binaries = {"ios": fake_exe(tmp, "ios"), "iproxy": fake_exe(tmp, "ipr"),
-                "pymobiledevice3": fake_exe(tmp, "pmd"), "xcode": str(tmp)}
-    signing = {"p8_path": str(_p8(tmp)), "key_id": "K1", "issuer_id": "I1",
-               "team_id": "TEAM99"}
-    devices = [{"udid": "U1", "name": "phone one",
-                "accounts": [{"platform": "tiktok", "username": " @Handle ",
-                              "created_at": "2026-08-01T00:00:00",
-                              "keywords": "a, b,, c"}]}]
-    cfg = S.build_config(binaries, signing, devices)
-    acct = cfg["devices"][0]["accounts"][0]
-    check("handle cleaned", acct["username"] == "Handle")
-    check("keywords split", acct["keywords"] == ["a", "b", "c"])
-    check("date trimmed to day", acct["created_at"] == "2026-08-01")
-    check("bundle id derived", cfg["devices"][0]["wda_bundle_id"]
-          == "com.team99.autowarmer.wda.xctrunner")
-    check("developer dir carried", cfg["developer_dir"] == str(tmp))
-    check("first phone mirrored top-level", cfg["udid"] == "U1")
-    check("no cloud keys written",
-          not any(k in json.dumps(cfg).lower()
-                  for k in ("agent_key", "base_url", "api_key")))
+class InstallerTests(unittest.TestCase):
+    def test_hash_failure_preserves_existing_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            old = dest / "ios"
+            old.write_bytes(b"working-old")
+            old.chmod(0o755)
+            with mock.patch.object(install_tools.urllib.request, "urlopen",
+                                   return_value=FakeResponse(b"not-the-release")):
+                result = install_tools.install_go_ios(dest, lambda _: None)
+            self.assertFalse(result["ok"])
+            self.assertEqual(old.read_bytes(), b"working-old")
 
-    path = tmp / "config.json"
-    S.save_config(path, cfg)
-    check("saved and reloadable", S.load_config(path)["udid"] == "U1")
-    check("no temp file left", not (tmp / "config.json.tmp").exists())
-    check("is_configured true", S.is_configured(S.load_config(path)))
-    check("is_configured false for empty", not S.is_configured({"devices": []}))
+    def test_version_failure_preserves_existing_binary(self):
+        archive = zip_with_ios()
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            old = dest / "ios"
+            old.write_bytes(b"working-old")
+            old.chmod(0o755)
+            with mock.patch.object(install_tools, "GO_IOS_SHA256",
+                                   hashlib.sha256(archive).hexdigest()), \
+                    mock.patch.object(install_tools, "GO_IOS_BINARY_SHA256",
+                                      hashlib.sha256(b"verified-go-ios").hexdigest()), \
+                    mock.patch.object(install_tools.urllib.request, "urlopen",
+                                      return_value=FakeResponse(archive)), \
+                    mock.patch.object(install_tools.subprocess, "run",
+                                      return_value=subprocess.CompletedProcess(
+                                          [], 0, '{"version":"9.9.9"}', "")):
+                result = install_tools.install_go_ios(dest, lambda _: None)
+            self.assertFalse(result["ok"])
+            self.assertEqual(old.read_bytes(), b"working-old")
 
-    # a second pass must not lose settings made outside the wizard
-    existing = {**cfg, "trace_level": "full",
-                "devices": [{**cfg["devices"][0], "screen_points": [375, 667]}]}
-    again = S.build_config(binaries, signing, devices, existing=existing)
-    check("screen size preserved", again["devices"][0]["screen_points"] == [375, 667])
-    check("trace level preserved", again["trace_level"] == "full")
+    def test_verified_candidate_replaces_atomically_after_version_check(self):
+        payload = b"new-verified-binary"
+        archive = zip_with_ios(payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            old = dest / "ios"
+            old.write_bytes(b"working-old")
+            old.chmod(0o755)
 
+            def fake_run(argv, **kwargs):
+                if argv[0] == "xattr":
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return subprocess.CompletedProcess(argv, 0,
+                                                   '{"version":"1.2.1"}', "")
 
-def test_resolve_device():
-    print("account → phone")
-    cfg = {"devices": [
-        {"udid": "U1", "accounts": [{"platform": "instagram", "username": "same"},
-                                    {"platform": "tiktok", "username": "only_tt"}]},
-        {"udid": "U2", "accounts": [{"platform": "tiktok", "username": "same"}]}]}
-    check("unique handle resolves", S.resolve_device(cfg, "only_tt") == "U1")
-    check("@ and case tolerated", S.resolve_device(cfg, "@ONLY_TT") == "U1")
-    check("platform disambiguates",
-          S.resolve_device(cfg, "same", "instagram") == "U1"
-          and S.resolve_device(cfg, "same", "tiktok") == "U2")
-    for handle, why in (("ghost", "unknown"), ("same", "ambiguous")):
-        try:
-            S.resolve_device(cfg, handle)
-            check(f"{why} handle refused", False)
-        except LookupError:
-            check(f"{why} handle refused", True)
-    check("accounts_of flattens", len(S.accounts_of(cfg)) == 3)
+            with mock.patch.object(install_tools, "GO_IOS_SHA256",
+                                   hashlib.sha256(archive).hexdigest()), \
+                    mock.patch.object(install_tools, "GO_IOS_BINARY_SHA256",
+                                      hashlib.sha256(payload).hexdigest()), \
+                    mock.patch.object(install_tools.urllib.request, "urlopen",
+                                      return_value=FakeResponse(archive)), \
+                    mock.patch.object(install_tools.subprocess, "run",
+                                      side_effect=fake_run) as run:
+                result = install_tools.install_go_ios(dest, lambda _: None)
+            self.assertTrue(result["ok"])
+            self.assertEqual(old.read_bytes(), payload)
+            self.assertEqual(stat.S_IMODE(old.stat().st_mode), 0o755)
+            self.assertEqual(list(dest.glob(".ios-*.candidate")), [])
+            xattr = next(call for call in run.call_args_list
+                         if call.args[0][0] == "xattr")
+            self.assertEqual(xattr.kwargs["timeout"], 10)
 
+    def test_download_size_limit_preserves_existing_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            old = dest / "ios"
+            old.write_bytes(b"working-old")
+            with mock.patch.object(install_tools, "MAX_GO_IOS_BYTES", 3), \
+                    mock.patch.object(install_tools.urllib.request, "urlopen",
+                                      return_value=FakeResponse(b"1234")):
+                result = install_tools.install_go_ios(dest, lambda _: None)
+            self.assertFalse(result["ok"])
+            self.assertEqual(old.read_bytes(), b"working-old")
 
-def test_installer():
-    print("auto-install")
-    from autowarmer import install_tools as I
-    tmp = Path(tempfile.mkdtemp())
-    logs = []
+class ApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
 
-    # a stand-in for the GitHub download: a zip carrying a fake `ios` binary
-    import zipfile
-    fake_zip = tmp / "go-ios-mac.zip"
-    with zipfile.ZipFile(fake_zip, "w") as z:
-        z.writestr("ios", "#!/bin/sh\necho '{\"version\":\"v9.9.9\"}'\n")
-    real_urlopen = I.urllib.request.urlopen
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
 
-    class FakeResp:
-        def __init__(self, data):
-            self._d = data
-        def read(self, n=-1):
-            d, self._d = self._d, b""
-            return d
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            return False
+    def read_json(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=3) as response:
+            return response.status, json.loads(response.read())
 
-    def fake_urlopen(req, timeout=0):
-        url = req.full_url if hasattr(req, "full_url") else str(req)
-        if "api.github.com" in url:
-            return FakeResp(json.dumps({"tag_name": "v9.9.9", "assets": [
-                {"name": "go-ios-mac.zip", "browser_download_url": "http://x/mac.zip"}]}).encode())
-        return FakeResp(fake_zip.read_bytes())
+    def test_state_is_redacted_and_diagnostic_only(self):
+        with mock.patch("autowarmer.app.setup.detect_all", return_value=[{
+            "name": "ios", "label": "go-ios", "found": True,
+            "path": "/private/path", "source": "secret", "hint": "none",
+        }]):
+            code, body = self.read_json("/api/state")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["control_disabled"])
+        self.assertEqual(body["mode"], "diagnostic-only")
+        serialized = json.dumps(body).lower()
+        for forbidden in ("/private/path", "udid", "p8_path", "accounts", "proxies"):
+            self.assertNotIn(forbidden, serialized)
 
-    I.urllib.request.urlopen = fake_urlopen
-    try:
-        res = I.install_go_ios(tmp / "bin", log=logs.append)
-    finally:
-        I.urllib.request.urlopen = real_urlopen
-    check("go-ios installed", res["ok"], )
-    dest = Path(res["path"])
-    check("landed in our own bin", dest == tmp / "bin" / "ios")
-    check("binary is executable", os.access(dest, os.X_OK))
-    check("version was verified", any("v9.9.9" in l for l in logs))
-    check("picked the mac asset", any("go-ios-mac.zip" in l for l in logs))
+    def test_old_device_and_job_endpoints_are_gone(self):
+        for path in ("/api/devices", "/api/job"):
+            with self.subTest(path=path):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    self.read_json(path)
+                self.assertEqual(caught.exception.code, 410)
 
-    # a download that carries no `ios` binary must fail loudly, not silently
-    bad_zip = tmp / "bad.zip"
-    with zipfile.ZipFile(bad_zip, "w") as z:
-        z.writestr("readme.txt", "nope")
+    def test_post_is_rejected_without_echoing_body(self):
+        secret = b'{"p8":"PRIVATE-KEY","udid":"SECRET-DEVICE"}'
+        request = urllib.request.Request(self.base + "/api/config", data=secret,
+                                         method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=3)
+        self.assertEqual(caught.exception.code, 409)
+        body = caught.exception.read().decode()
+        self.assertNotIn("PRIVATE-KEY", body)
+        self.assertNotIn("SECRET-DEVICE", body)
 
-    def bad_urlopen(req, timeout=0):
-        url = req.full_url if hasattr(req, "full_url") else str(req)
-        if "api.github.com" in url:
-            raise OSError("rate limited")        # exercises the fallback URL
-        return FakeResp(bad_zip.read_bytes())
-
-    I.urllib.request.urlopen = bad_urlopen
-    try:
-        res2 = I.install_go_ios(tmp / "bin2", log=logs.append)
-    finally:
-        I.urllib.request.urlopen = real_urlopen
-    check("bad download refused", not res2["ok"] and "ios` binary" in res2["error"])
-    check("api failure falls back to the direct URL",
-          any("standard URL" in l for l in logs))
-
-    # the screen text reader really builds (swiftc ships with Xcode)
-    logs2 = []
-    ocr = I.build_ocr(ROOT, log=logs2.append)
-    check("text reader builds", ocr["ok"] and Path(ocr["path"]).is_file())
-
-    check("unknown tool refused", not I.install("nonsense", ROOT, logs.append)["ok"])
-    check("only fetchable tools offered",
-          set(I.TOOLS) == {"ios", "pymobiledevice3", "ocr"})
-
-
-def test_jobs():
-    print("job runner")
-    tmp = Path(tempfile.mkdtemp())
-    r = Runner(tmp)
-    # a stand-in for `python3 -m autowarmer …` that just prints and exits
-    r.python = sys.executable
-    job = r.start("doctor", "this Mac", [])
-    job.proc and job.proc.wait(timeout=30)
-    time.sleep(0.4)
-    check("job records a result", job.status in ("done", "failed"))
-    check("job snapshot has the basics",
-          {"id", "kind", "status", "elapsed"} <= set(job.snapshot()))
-    check("history lists it", any(j["id"] == job.id for j in r.recent()))
-    check("tail returns lines list", isinstance(r.tail(job.id)["lines"], list))
-    check("unknown job id handled", "error" in r.tail("nope"))
-
-    # one at a time: a live job blocks a second start
-    long = Runner(tmp)
-    long.python = sys.executable
-    j2 = long.start("warm", "@a", [])
-    j2.proc.stdout and None
-    if j2.status == "running":
-        try:
-            long.start("warm", "@b", [])
-            check("second run refused while one is live", False)
-        except Busy as e:
-            check("second run refused while one is live", "still running" in str(e))
-    else:
-        check("second run refused while one is live", True)   # too fast to race
-    long.stop(j2.id)
+    def test_oversized_post_is_rejected_before_body_read(self):
+        request = urllib.request.Request(self.base + "/api/config", data=b"x",
+                                         method="POST",
+                                         headers={"Content-Length": str(app.MAX_BODY_BYTES + 1)})
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=3)
+        self.assertEqual(caught.exception.code, 413)
 
 
-def test_api():
-    print("local API")
-    tmp = Path(tempfile.mkdtemp())
-    cfgp = tmp / "config.json"
-    from http.server import ThreadingHTTPServer
-    from autowarmer import app as A
-    A.Handler.config_path = cfgp
-    A.Handler.runner = Runner(ROOT)
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), A.Handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{srv.server_address[1]}"
+class StaticSurfaceTests(unittest.TestCase):
+    def test_public_modules_have_no_signing_or_device_config_surface(self):
+        setup_source = (ROOT / "autowarmer" / "setup_flow.py").read_text()
+        app_source = (ROOT / "autowarmer" / "app.py").read_text()
+        cli_source = (ROOT / "autowarmer" / "__main__.py").read_text()
+        for forbidden in ("store_p8", "build_config", "list_devices"):
+            self.assertNotIn(forbidden, setup_source)
+            self.assertNotIn(forbidden, app_source)
+        self.assertNotIn("--ios-binary", cli_source)
+        self.assertNotIn("xcodebuild", (ROOT / "autowarmer" / "runner_build.py").read_text())
+        self.assertNotIn("xattr -dr", (ROOT / "AutoWarmer.command").read_text())
 
-    def call(method, path, body=None):
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(base + path, method=method, data=data,
-                                     headers={"Content-Type": "application/json"}
-                                     if body is not None else {})
-        try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                raw = r.read()
-                ct = r.headers.get("Content-Type", "")
-                return r.status, (json.loads(raw) if "json" in ct else raw)
-        except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read() or b"{}")
+    def test_distribution_excludes_private_and_legacy_configuration(self):
+        readme = (ROOT / "README.md").read_text().lower()
+        config = (ROOT / "config.example.json").read_text().lower()
+        for forbidden in ("p8_path", "--live", "warm-all",
+                          "pymobiledevice3", "vision_ocr"):
+            self.assertNotIn(forbidden, readme)
+        for forbidden in ("p8", "udid", "username", "password", "proxy_host"):
+            self.assertNotIn(forbidden, config)
+        self.assertEqual(
+            ["autowarmer", "README.md", "LICENSE", "AutoWarmer.command"],
+            make_zip.INCLUDE,
+        )
 
-    code, page = call("GET", "/")
-    check("dashboard page served", code == 200 and b"AutoWarmer" in page)
-    # "API key" and "sign in" appear legitimately (the Apple developer flow),
-    # so look for markers that only a hosted/billing product would carry
-    check("page has no cloud or billing references",
-          not any(w in page.lower() for w in
-                  (b"stripe", b"subscription", b"billing", b"agent key",
-                   b"checkout", b"free tier")))
+    def test_built_archive_contains_only_the_public_diagnostic_surface(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "autowarmer").mkdir()
+            (root / "autowarmer" / "__init__.py").write_text("safe = True\n")
+            (root / "README.md").write_text("diagnostic only\n")
+            (root / "LICENSE").write_text("license\n")
+            launcher = root / "AutoWarmer.command"
+            launcher.write_text("#!/bin/sh\n")
+            launcher.chmod(0o755)
+            (root / "private").mkdir()
+            (root / "private" / "inventory.json").write_text("secret\n")
+            (root / "bin").mkdir()
+            (root / "bin" / "ios").write_bytes(b"helper")
+            (root / "config.example.json").write_text("legacy\n")
 
-    code, st = call("GET", "/api/state")
-    check("state before setup", code == 200 and st["configured"] is False)
-    check("state offers detection", isinstance(st.get("detected"), list))
+            with mock.patch.object(make_zip, "ROOT", root), \
+                    mock.patch.object(sys, "argv", ["make_zip.py", "test"]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                make_zip.main()
 
-    code, chk = call("POST", "/api/check-path", {"name": "ios", "path": "/nope"})
-    check("path check reachable", code == 200 and chk["ok"] is False)
+            with zipfile.ZipFile(root / "dist" / "AutoWarmer-test.zip") as archive:
+                names = set(archive.namelist())
+                mode = archive.getinfo(
+                    "AutoWarmer-test/AutoWarmer.command").external_attr >> 16
+            self.assertEqual(names, {
+                "AutoWarmer-test/autowarmer/__init__.py",
+                "AutoWarmer-test/README.md",
+                "AutoWarmer-test/LICENSE",
+                "AutoWarmer-test/AutoWarmer.command",
+            })
+            self.assertEqual(stat.S_IMODE(mode), 0o755)
 
-    cfg = good_config(tmp)
-    payload = {"binaries": {"ios": cfg["ios_binary"], "iproxy": cfg["iproxy_binary"],
-                            "pymobiledevice3": cfg["pymobiledevice3_binary"]},
-               "signing": cfg["signing"], "devices": cfg["devices"]}
-    code, out = call("POST", "/api/config", payload)
-    check("config saved", code == 200 and out["saved"])
-    check("config landed on disk", cfgp.is_file())
+    def test_web_server_does_not_open_browser_by_default(self):
+        import inspect
+        default = inspect.signature(app.serve).parameters["open_browser"].default
+        self.assertIs(default, False)
 
-    bad = {**payload, "devices": [{"udid": "", "accounts": []}]}
-    code, out = call("POST", "/api/config", bad)
-    check("invalid config refused", code == 400 and out["problems"])
-    check("still the good config on disk",
-          S.load_config(cfgp)["devices"][0]["udid"] == "UDID-A")
+    def test_public_ui_has_no_mutating_controls(self):
+        source = (ROOT / "autowarmer" / "ui.html").read_text().lower()
+        for forbidden in ("type=\"file\"", "p8", "api/config", "api/devices",
+                          "warm-all", "onboard", "install runner"):
+            self.assertNotIn(forbidden, source)
+        self.assertIn("phone control is disabled", source)
 
-    code, st = call("GET", "/api/state")
-    check("state after setup", code == 200 and st["configured"] is True)
-    check("phones reported", st["devices"][0]["name"] == "iphone-1")
-    check("phone shows disconnected", st["devices"][0]["connected"] is False)
-
-    code, out = call("POST", "/api/run", {"kind": "nonsense"})
-    check("unknown action refused", code == 400)
-    code, out = call("POST", "/api/run", {"kind": "warm"})
-    check("warm without a handle refused", code == 400)
-
-    code, out = call("GET", "/api/job?id=missing")
-    check("missing job handled", code == 200 and "error" in out)
-    srv.shutdown()
-
-
-
-def main():
-    test_detection()
-    test_bundle_and_signing()
-    test_apple_key_storage()
-    test_config_validation()
-    test_build_and_save_config()
-    test_resolve_device()
-    test_installer()
-    test_jobs()
-    test_api()
-    print()
-    if FAILS:
-        print(f"{FAILS} FAILED")
-        sys.exit(1)
-    print("all tests passed")
+    def test_legacy_modules_have_no_executable_control_implementation(self):
+        legacy = (
+            "ai.py", "apps.py", "device.py", "engage.py", "engine.py",
+            "fleet.py", "humanize.py", "incubation.py", "jobs.py",
+            "perceive.py", "schedule.py", "screens.py", "trace.py",
+            "vision.py",
+        )
+        forbidden = (
+            "subprocess", "urllib", "xcodebuild", "xcuitest", "/wda/",
+            "com.burbn.instagram", "com.zhiliaoapp.musically",
+            ".screenshot(", ".tap(", ".swipe(", "launch_app(",
+            "terminate_app(", "popen(", "urlopen(",
+        )
+        for name in legacy:
+            source = (ROOT / "autowarmer" / name).read_text().lower()
+            with self.subTest(module=name):
+                for fragment in forbidden:
+                    self.assertNotIn(fragment, source)
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main(verbosity=2)

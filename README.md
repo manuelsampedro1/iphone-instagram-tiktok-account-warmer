@@ -1,88 +1,78 @@
-# AutoWarmer
+# AutoWarmer 1.0.0, diagnostic safety fork
 
-Warm up **your own** Instagram and TikTok accounts on **your own** iPhone.
+This is an unofficial diagnostic adaptation of the published AutoWarmer 1.0.0
+source. It can verify one pinned Mac helper and report a redacted model and iOS
+version for connected iPhones.
 
-AutoWarmer drives a real iPhone over USB and behaves like a person using it:
-it opens the app, checks it is on the right account, watches a feed, and
-occasionally likes, saves or follows. Every account follows a day-by-day ramp
-measured from the date it was created, so a fresh account browses quietly and
-an older one does more.
+It cannot control Instagram or TikTok, accept account or proxy data, sign
+Apple code, provision devices, install software on an iPhone, or run the
+original account automation. Those paths fail closed.
 
-Everything runs on your Mac. No account is created for you, nothing is
-uploaded, and there is no server involved.
+## Important limitation
 
-## Download
+The author's 1.0.0 release contains source code, not an iPhone application.
+There is no `.app` or `.ipa` to install. It also omits the custom runner source
+required by its original control code. Installing the stock upstream runner
+would not make the release functional.
 
-Grab the latest **AutoWarmer-x.y.z.zip** from
-[Releases](https://github.com/Tej-Sharma/iphone-instagram-tiktok-account-warmer/releases/latest), unzip it, then **right-click
-`AutoWarmer.command` and choose Open** the first time (macOS blocks anything
-downloaded from the internet on a plain double-click).
+This repository therefore provides a Mac-side USB diagnosis only. A passing
+diagnosis confirms the number, model, and iOS version of connected devices. It
+does not claim that AutoWarmer was installed on either phone.
 
-Or run it from a clone:
+## Safe commands
 
-```bash
-python3 -m autowarmer
-```
-
-The dashboard opens at `http://127.0.0.1:8790`.
-
-## What you need
-
-| Thing | What it does | Who installs it |
-|---|---|---|
-| macOS + full Xcode | builds the helper app that drives your phone | you, from the App Store |
-| git | fetches that helper app's source | you, `xcode-select --install` |
-| go-ios | talks to the phone over USB | **AutoWarmer** |
-| pymobiledevice3 | starts the helper app on the phone | **AutoWarmer** |
-| An Apple Developer membership | Apple requires the phone's owner to sign the helper app | you (paid tier; free Apple IDs cannot issue API keys) |
-
-Setup asks for an App Store Connect API key (`.p8`) plus its Key ID, Issuer ID
-and Team ID. AutoWarmer keeps a private copy in `~/.autowarmer/keys` (readable
-only by you) and never sends it anywhere.
-
-## How it works
-
-```
-config.json ─▶ incubation ─▶ humanize ─▶ engine ─▶ apps ─▶ device ─▶ iPhone
- accounts       day → phase   coin-flips  orchestr. open/    go-ios +
- + interests    ramp          + skewed              verify   pymobiledevice3
-                              dwell times                    + WebDriverAgent
-```
-
-Nothing emits a quota. Each like, save or follow is an independent chance;
-watch times are drawn from a right-skewed distribution; sessions land on a
-daily rhythm with a sleep gap. The loop refuses to scroll a screen it has not
-confirmed is a feed, adapts when the feed stops advancing, and stops after
-repeated failures.
-
-**Practice mode** (`--no-engage`, or the Practice button) drives everything for
-real but holds every like, follow and save. Use it the first time on any phone.
-
-## Command line
+From this directory:
 
 ```bash
-python3 -m autowarmer doctor          # what's installed, what's missing
-python3 -m autowarmer install all     # fetch what can be fetched
-python3 -m autowarmer status          # each account's day, phase and rates
-python3 -m autowarmer warm <handle>   # dry run; --live to drive the phone
-python3 -m autowarmer warm-all        # every connected phone, in turn
-python3 tests/test_autowarmer.py      # the test suite
+python3 -m autowarmer doctor
+python3 -m autowarmer diagnose
+python3 -m autowarmer serve
+python3 -m autowarmer serve --open
+python3 tests/test_autowarmer.py
 ```
 
-## Scope
+`diagnose` also accepts optional `--expect-count` and `--model` gates when an
+operator wants to enforce an expected inventory without publishing that local
+inventory in this repository.
 
-AutoWarmer warms accounts. It does not post. Automated posting, multi-phone
-fleet operation and managed warmed accounts are commercial products — contact
-**team@earshot.to**.
+Running the module without a command prints help and makes no device request.
+The local web page binds to `127.0.0.1` and does not open a browser unless
+`--open` is supplied.
 
-Use it only on accounts and devices you own, and follow the terms of the
-platforms you use it with.
+Before every diagnosis, the helper must match the pinned extracted-binary
+SHA-256, have an executable regular-file mode, and report go-ios 1.2.1. If
+`bin/ios` is absent, this command downloads the exact pinned release, checks
+the archive hash, extracted-binary hash, and version, then replaces the local
+helper atomically:
 
-## Licence
+```bash
+python3 -m autowarmer install ios
+```
 
-[Business Source License 1.1](LICENSE). In short: use it freely for your own
-accounts on your own devices, including commercially. You may not use it to
-provide a service to third parties or to compete with the Licensor. It converts
-to Apache 2.0 on 2030-08-07. For any other arrangement, contact team@earshot.to.
+That install command changes files on the Mac and requires network access. It
+does not install anything on an iPhone.
 
-— built by [Earshot](https://earshot.to)
+## Privacy boundary
+
+The public CLI and web page do not accept device identifiers, account handles,
+proxies, Apple keys, or social login data. Diagnostic output omits device names
+and identifiers, including on errors. Legacy automation commands are not
+registered; the argument parser rejects them without invoking a command
+handler.
+
+Any operator inventory must remain outside this repository. It is ignored by
+Git and is never loaded by this build.
+
+## Provenance
+
+This copy derives from:
+
+- Repository: `Tej-Sharma/iphone-instagram-tiktok-account-warmer`
+- Tag: `v1.0.0`
+- Commit: `5f4b8ec0ffdcb23ef37ba0f1b472b70db7dc1ff0`
+- Published ZIP SHA-256: `cc268ab9d30fde05d5f3bd1df05fbeef2ed98956acc9faca13ca8594bc406b1f`
+
+The published tag and commit are not cryptographically signed. The included
+[Business Source License 1.1](LICENSE) states a change to Apache 2.0 on
+2030-08-07. BSL 1.1 is source available during its restriction period, not an
+OSI-approved open source license.
