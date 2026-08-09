@@ -10,9 +10,10 @@ configuración y no ejecuta sus rutinas.
 
 ### No migrar secretos ni sesiones
 
-Se copian alias, handles y referencias de proxy sin credenciales. No se leen
-ni trasladan contraseñas, cookies, tokens, sesiones, claves Apple o
-identificadores completos de dispositivo.
+Este fork no copia ni traslada alias, handles, referencias de proxy,
+contraseñas, cookies, tokens, sesiones, claves Apple o identificadores
+completos de dispositivo. Cualquier inventario externo queda fuera del código,
+del ZIP y del repositorio público.
 
 ### Distribuir solo el diagnóstico
 
